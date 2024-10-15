@@ -40,6 +40,42 @@ TEXT_THRESHOLD = 0.25
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 MAX_DEPTH = 10.0
 
+def to_homo(pts):
+  '''
+  @pts: (N,3 or 2) will homogeneliaze the last dimension
+  '''
+  assert len(pts.shape)==2, f'pts.shape: {pts.shape}'
+  homo = np.concatenate((pts, np.ones((pts.shape[0],1))),axis=-1)
+  return homo
+
+def detect_if_tracking_in_mask(K,bbox,ob_in_cam,mask):
+    def get_uv(start,end):
+        pts = np.stack((start,end),axis=0).reshape(-1,3)
+        pts = (ob_in_cam@to_homo(pts).T).T[:,:3]   #(2,3)
+        projected = (K@pts.T).T
+        return np.round(projected[:,:2]/projected[:,2].reshape(-1,1)).astype(int)   #(2,2)
+
+    min_xyz = bbox.min(axis=0)
+    xmin, ymin, zmin = min_xyz
+    max_xyz = bbox.max(axis=0)
+    xmax, ymax, zmax = max_xyz
+
+    xs = []
+    ys = []
+
+    for x in [xmin,xmax]:
+        for y in [ymin,ymax]:
+            start = np.array([x,y,zmin])
+            end = start+np.array([0,0,zmax-zmin])
+            uv = get_uv(start,end)
+            xs += [uv[0,0],uv[1,0]]
+            ys += [uv[0,1],uv[1,1]]
+
+    mask_in_bbox = np.zeros_like(mask)
+    mask_in_bbox[min(ys):max(ys), min(xs):max(xs)] = mask[min(ys):max(ys), min(xs):max(xs)]
+    
+    return np.sum(mask_in_bbox)/np.sum(mask) > 0.7
+
 if __name__=='__main__':
     parser = argparse.ArgumentParser()
     code_dir = os.path.dirname(os.path.realpath(__file__))
@@ -50,6 +86,7 @@ if __name__=='__main__':
     parser.add_argument('--debug', type=int, default=1)
     parser.add_argument('--debug_dir', type=str, default=f'{code_dir}/debug')
     parser.add_argument('--repose_freq', type=int, default=-1)
+    parser.add_argument('--detect_tracking_loss', action='store_true')
     args = parser.parse_args()
 
     set_logging_format()
@@ -173,7 +210,7 @@ if __name__=='__main__':
 
             remask = i==0 or (args.repose_freq>0 and not i%args.repose_freq)
 
-            if remask:
+            if remask or args.detect_tracking_loss:
                 text = args.object_to_track + ' . object .'
 
                 image_source = np.asarray(cv2.cvtColor(color_image, cv2.COLOR_BGR2RGB))
@@ -223,7 +260,7 @@ if __name__=='__main__':
 
                 confidences = confidences.numpy()[correct_label].tolist()
 
-                if len(confidences)==0:
+                if (i==0) and len(confidences)==0:
                     print("No mask detections!")
                     continue
 
@@ -261,6 +298,8 @@ if __name__=='__main__':
                 if debug>=2:
                     cv2.imwrite(os.path.join(f'{debug_dir}/grounded_sam2_{i}.jpg'), annotated_frame)
 
+            if remask:
+
                 pose = est.register(K=K, rgb=color, depth=depth, ob_mask=mask, iteration=args.est_refine_iter)
                 
                 if debug>=3:
@@ -274,6 +313,11 @@ if __name__=='__main__':
 
             else:
                 pose = est.track_one(rgb=color, depth=depth, K=K, iteration=args.track_refine_iter)
+                if args.detect_tracking_loss and len(confidences)>0:
+                    center_pose = pose@np.linalg.inv(to_origin)
+                    if not detect_if_tracking_in_mask(K,bbox,center_pose,mask):
+                        pose = est.register(K=K, rgb=color, depth=depth, ob_mask=mask, iteration=args.est_refine_iter)
+                    
 
             os.makedirs(f'{debug_dir}/ob_in_cam', exist_ok=True)
             np.savetxt(f'{debug_dir}/ob_in_cam/{i}.txt', pose.reshape(4,4))
